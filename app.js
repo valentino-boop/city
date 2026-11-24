@@ -30,11 +30,11 @@
     '#FF7C45', '#FF6844', '#FF5544'];
 
   // 건물 용도·높이·면적별 16색 (따뜻한 건축 일러스트 톤)
-  const BLD0 = ['#C58A5E', '#D49B70', '#AC6E4B', '#E8D7BA', '#DCCAAF', '#F1E5CE',
-    '#CFB893', '#BFAA89', '#93A7B6', '#7F94A6', '#63798E', '#AEBCC6',
-    '#D8D2C3', '#C9AE8B', '#B08F6E', '#EEE7D8'];
+  const BLD0 = ['#BE7038', '#CE8452', '#A85B33', '#E3C79B', '#D8BE96', '#EDD8B4',
+    '#C9B183', '#B9A176', '#7E97AD', '#6C87A0', '#4E6B85', '#9FB2C0',
+    '#D2C9B6', '#D2AE7D', '#B08858', '#EDE2CC'];
   // 벽면 음영으로 어두워지는 만큼 밝게 보정
-  const BLD = BLD0.map((c, i) => mixc(c, i >= 8 && i < 12 ? '#eef4f8' : '#fff8ec', 0.16));
+  const BLD = BLD0.map((c, i) => mixc(c, i >= 8 && i < 12 ? '#eef4f8' : '#fff8ec', 0.10));
 
   const DAY = {
     bg: '#F2EBDF', ground: '#EFE8DA',
