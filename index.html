@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>서울 유동인구 3D 시티맵</title>
+<meta name="description" content="서울 생활인구 데이터로 본 시간대별 도로 유동인구 3D 지도">
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  :root {
+    --bg: #efe8db;
+    --ink: #24282f;
+    --sub: #6d7683;
+    --panel: rgba(255, 252, 246, 0.80);
+    --panel-2: rgba(255, 252, 246, 0.55);
+    --line: rgba(74, 62, 45, 0.14);
+    --accent: #c15f3c;
+    --accent-soft: rgba(193, 95, 60, 0.16);
+    --thumb: #ffffff;
+    --shadow: 0 12px 40px rgba(58, 44, 26, 0.18);
+    --grad: linear-gradient(90deg,#ded5c3,#f2c896,#ea8c58,#c2483c);
+    --t: 0;
+  }
+  body.is-night {
+    --bg: #060b16;
+    --ink: #eaf2ff;
+    --sub: #93a6c1;
+    --panel: rgba(9, 14, 25, 0.74);
+    --panel-2: rgba(9, 14, 25, 0.5);
+    --line: rgba(130, 170, 220, 0.20);
+    --accent: #ff9a5a;
+    --accent-soft: rgba(255, 154, 90, 0.18);
+    --thumb: #fff3e2;
+    --shadow: 0 14px 46px rgba(0, 0, 0, 0.55);
+    --grad: linear-gradient(90deg,#101f33,#1f5a60,#b8792f,#ff5f45);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+    font-family: "Pretendard", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo",
+      "Noto Sans KR", "Malgun Gothic", sans-serif;
+    -webkit-font-smoothing: antialiased; transition: background .6s ease; }
+  #map { position: absolute; inset: 0; }
+  .hud { position: absolute; pointer-events: none; color: var(--ink); transition: color .5s ease; }
+
+  /* ---------- title ---------- */
+  .scrim { position: absolute; pointer-events: none; border-radius: 18px;
+    background: radial-gradient(120% 120% at 0% 0%, rgba(255,253,247,.86) 0%, rgba(255,253,247,.55) 62%, rgba(255,253,247,0) 100%);
+    transition: background .6s ease; }
+  body.is-night .scrim { background: radial-gradient(120% 120% at 0% 0%, rgba(6,11,22,.82) 0%, rgba(6,11,22,.45) 62%, rgba(6,11,22,0) 100%); }
+  .scrim-l { left: 8px; top: 6px; width: 420px; height: 132px; }
+  .scrim-r { right: 8px; top: 2px; width: 250px; height: 124px; }
+  .title { left: 26px; top: 22px; max-width: 46vw; }
+  .title h1 { margin: 0; font-size: 19px; font-weight: 750; letter-spacing: -.35px;
+    text-shadow: 0 1px 14px rgba(255,255,255,.55); }
+  body.is-night .title h1 { text-shadow: 0 2px 16px rgba(0,0,0,.85); }
+  .title p { margin: 6px 0 0; font-size: 11.5px; color: var(--sub); letter-spacing: .05px;
+    line-height: 1.5; }
+  .title .pill { display: inline-block; margin-top: 9px; padding: 3px 9px; border-radius: 999px;
+    font-size: 10px; letter-spacing: .2px; color: var(--accent);
+    background: var(--accent-soft); border: 1px solid var(--line); }
+
+  /* ---------- clock ---------- */
+  .clock { right: 26px; top: 18px; text-align: right; }
+  .clock .t { font-size: 44px; font-weight: 800; letter-spacing: -1.6px; line-height: .95;
+    font-variant-numeric: tabular-nums; }
+  .clock .d { font-size: 11.5px; color: var(--sub); margin-top: 7px; letter-spacing: .3px; }
+  .clock .m { font-size: 10px; color: var(--sub); margin-top: 3px; opacity: .8; }
+
+  /* ---------- bottom panel ---------- */
+  .panel { position: absolute; left: 50%; transform: translateX(-50%); bottom: 20px;
+    width: min(760px, calc(100% - 40px)); padding: 13px 18px 11px; border-radius: 16px;
+    background: var(--panel); border: 1px solid var(--line); backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px); box-shadow: var(--shadow); pointer-events: auto;
+    transition: background .5s ease, border-color .5s ease; }
+  .row { display: flex; align-items: center; gap: 13px; }
+  #play { width: 36px; height: 36px; flex: 0 0 36px; border-radius: 50%; border: none;
+    background: var(--accent-soft); color: var(--accent); font-size: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; transition: transform .15s, background .2s; }
+  #play:hover { transform: scale(1.06); }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 5px;
+    border-radius: 3px; background: var(--grad); outline: none; cursor: pointer; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px;
+    border-radius: 50%; background: var(--thumb); border: 2px solid var(--accent);
+    box-shadow: 0 2px 8px rgba(0,0,0,.28); }
+  input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%;
+    background: var(--thumb); border: 2px solid var(--accent); }
+  .labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--sub);
+    margin: 7px 2px 0; letter-spacing: .4px; font-variant-numeric: tabular-nums; }
+  .seg { display: inline-flex; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 10px;
+    overflow: hidden; background: var(--panel-2); }
+  .seg button { background: transparent; color: var(--sub); border: none; padding: 6px 11px;
+    font-size: 11.5px; cursor: pointer; font-family: inherit; transition: all .18s; white-space: nowrap; }
+  .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+  .legend { display: flex; align-items: center; gap: 9px; font-size: 10px; color: var(--sub);
+    margin-top: 10px; letter-spacing: .2px; }
+  .bar { flex: 1; height: 7px; border-radius: 4px; background: var(--grad); }
+  .sep { width: 1px; height: 22px; background: var(--line); flex: 0 0 1px; }
+
+  /* ---------- corners ---------- */
+  .hint { right: 26px; bottom: 168px; font-size: 10px; color: var(--sub); text-align: right;
+    line-height: 1.6; max-width: 210px; opacity: .85; }
+  .credit { left: 26px; bottom: 168px; font-size: 9px; color: var(--sub); line-height: 1.5;
+    max-width: 230px; opacity: .8; }
+  .credit b { font-weight: 600; }
+
+  #loading { position: absolute; inset: 0; z-index: 20; display: flex; align-items: center;
+    justify-content: center; flex-direction: column; gap: 14px; background: #efe8db;
+    color: #6d7683; font-size: 12.5px; transition: opacity .5s ease; }
+  #loading.gone { opacity: 0; pointer-events: none; }
+  .spin { width: 28px; height: 28px; border: 2px solid rgba(190,140,100,.25);
+    border-top-color: #c15f3c; border-radius: 50%; animation: sp 1s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  #barwrap { width: 190px; height: 3px; border-radius: 2px; background: rgba(120,100,80,.16); overflow: hidden; }
+  #barfill { width: 0%; height: 100%; background: #c15f3c; transition: width .25s; }
+
+  @media (max-width: 1180px) { .credit, .hint { display: none; } }
+  @media (max-width: 700px) {
+    .title { max-width: 58vw; left: 16px; top: 14px; }
+    .title h1 { font-size: 15px; }
+    .title p { font-size: 10px; }
+    .title .pill { display: none; }
+    .clock { right: 16px; top: 12px; }
+    .clock .t { font-size: 30px; }
+    .clock .d { font-size: 10px; }
+    .panel { padding: 10px 12px 8px; bottom: 12px; border-radius: 13px; }
+    .seg button { padding: 5px 8px; font-size: 10.5px; }
+    .legend { font-size: 9px; }
+  }
+</style>
+</head>
+<body class="is-day">
+<div id="map"></div>
+
+<div id="loading">
+  <div class="spin"></div>
+  <div id="stat">서울 3D 데이터를 불러오는 중…</div>
+  <div id="barwrap"><div id="barfill"></div></div>
+</div>
+
+<div class="scrim scrim-l"></div>
+<div class="scrim scrim-r"></div>
+<div class="hud title">
+  <h1>서울 유동인구 · 3D 시티맵</h1>
+  <p>서울 생활인구(행정동) 2025.08–2026.07 · 건물 262,694동 · 도로 79,413개</p>
+  <span class="pill" id="mood">낮 · 건축 일러스트 톤</span>
+</div>
+
+<div class="hud clock">
+  <div class="t" id="clock">15:00</div>
+  <div class="d" id="daylab">평일 평균</div>
+  <div class="m" id="mood2">유동인구 밀도</div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="play" title="재생 (Space)">▶</button>
+    <input id="slider" type="range" min="0" max="23.99" step="0.01" value="15">
+    <div class="seg" id="dayseg">
+      <button data-day="0" class="on">평일</button><button data-day="1">주말</button>
+    </div>
+    <div class="sep"></div>
+    <div class="seg" id="mseg">
+      <button data-mode="auto" class="on">자동</button><button data-mode="day">낮</button><button data-mode="night">밤</button>
+    </div>
+  </div>
+  <div class="labels"><span>00</span><span>03</span><span>06</span><span>09</span><span>12</span><span>15</span><span>18</span><span>21</span><span>24</span></div>
+  <div class="legend">
+    <span>한산</span><div class="bar" id="lbar"></div><span>번잡</span>
+    <span style="margin-left:8px;opacity:.75" id="lname">도로 유동인구</span>
+  </div>
+</div>
+
+<div class="hint hud">드래그 회전 · 휠/두 손가락 확대<br>ctrl+드래그 기울기 · 스페이스 재생</div>
+<div class="credit hud">
+  건물·도로 <b>© OpenStreetMap</b> 기여자 · 배경 OpenFreeMap · 지형 AWS Terrain Tiles<br>
+  생활인구 <b>서울 열린데이터광장</b> OA-14991 (KT 기지국 기반)
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.1/dist/maplibre-gl.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
