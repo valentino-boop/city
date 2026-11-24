@@ -115,15 +115,13 @@
   /* ---------------------------------------------------------------- state */
   let map = null, ready = false;
   let hourF = 15, day = 0, mode = 'auto', playing = false;
-  let nightT = 0, lastHourKey = '', lastNightBucket = -1;
+  let nightT = 0;
   let buildings = null, roads = null, water = null, meta = null, lightPoints = null;
 
   const $ = (id) => document.getElementById(id);
   const stat = (msg, pct) => { $('stat').textContent = msg; if (pct != null) $('barfill').style.width = pct + '%'; };
 
   /* ---------------------------------------------------------------- data */
-  function b64ToBytes() { return null; }
-
   function loadBuffer(name, onProgress) {
     return fetch(DATA + name).then(r => {
       if (!r.ok) throw new Error(name + ' ' + r.status);
@@ -492,10 +490,6 @@ void main() {
 
     // 야간 창문 불빛
     if (on('lights')) map.addLayer(makeLightsLayer(lightPoints));
-  }
-
-  function lowerBoundary() {
-    if (hasLayer('b_bound')) map.moveLayer('b_bound');
   }
 
   /* ---------------------------------------------------------------- theme application */
