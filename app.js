@@ -1,5 +1,5 @@
 /* 서울 유동인구 · 3D 시티맵
-   MapLibre GL JS + 커스텀 WebGL 야간 조명 레이어 */
+   MapLibre GL JS + 커스텀 WebGL 도로(유동인구)·야간 조명 레이어 */
 (function () {
   'use strict';
 
@@ -52,6 +52,7 @@
     accentSoft: 'rgba(193,95,60,0.16)', thumb: '#ffffff', shadow: '0 12px 40px rgba(58,44,26,0.18)',
     lights: 0
   };
+  // 밤: 건물이 까맣게 묻히지 않도록 달빛(차가운 흰빛)을 세게, 발광은 은은하게
   const NIGHT = {
     bg: '#05090F', ground: '#0A1220',
     grass: '#0C1A1E', park: '#0E1F1E', wood: '#0B1A1B',
@@ -59,9 +60,9 @@
     relief: [[0, '#0B1522'], [30, '#0E1A28'], [90, '#12202F'], [200, '#172736'],
       [420, '#1C2E3F'], [700, '#223448'], [950, '#283B50']],
     hill: { exag: 0.42, high: '#33455E', shadow: '#010409', accent: '#0A1119' },
-    light: { color: '#3E4766', intensity: 0.45, pos: [1.3, 235, 30] },
+    light: { color: '#B3A896', intensity: 0.42, pos: [1.25, 232, 58] },
     ramp: RAMP_NIGHT,
-    casing: '#0B1622', casingOp: 0.4, glowOp: 0.32, coreOp: 1,
+    casing: '#0B1622', casingOp: 0.4, glowOp: 0.34, coreOp: 1,
     edge: '#FFB27A', edgeOp: 0.16, edgeBlur: 0,
     ink: '#eaf2ff', sub: '#93a6c1', panel: 'rgba(9,14,25,0.74)',
     panel2: 'rgba(9,14,25,0.5)', line: 'rgba(130,170,220,0.20)', accent: '#ff9a5a',
@@ -115,8 +116,10 @@
   /* ---------------------------------------------------------------- state */
   let map = null, ready = false;
   let hourF = 15, day = 0, mode = 'auto', playing = false;
-  let nightT = 0;
-  let buildings = null, roads = null, water = null, meta = null, lightPoints = null;
+  let nightT = 0, appliedT = -1;
+  let buildings = null, roads = null, water = null, lightPoints = null;
+  let roadMesh = null, roadLayer = null;
+  const roadStyle = { ramp: new Float32Array(48), glow: 0, core: 1 };
 
   const $ = (id) => document.getElementById(id);
   const stat = (msg, pct) => { $('stat').textContent = msg; if (pct != null) $('barfill').style.width = pct + '%'; };
@@ -185,6 +188,7 @@
 
   const MAJOR_K = { 0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 15: 1, 16: 1, 17: 1, 18: 1, 19: 1 };
 
+  /* GeoJSON 경로(폴백/비교용): data-driven paint */
   function decodeRoads(buf) {
     const dv = new DataView(buf), u8 = new Uint8Array(buf);
     const major = [], minor = [];
@@ -213,9 +217,303 @@
              minor: { type: 'FeatureCollection', features: minor } };
   }
 
+  /* ---------------------------------------------------------------- road mesh (GPU) */
+  // 도로 세그먼트를 셰이더용 삼각형 메시로 굽는다.
+  //  정점 8바이트: [pos x,y:int16(QS단위)] [dir x,y:int8(수직 단위벡터)] [hw:uint8(0.02px)] [side:uint8]
+  //  레벨 버퍼 1바이트/정점: 유동인구 칸(0~240 = 레벨×16) → 셰이더가 16단계 램프를 연속 보간
+  function buildRoadMesh(buf) {
+    const dv = new DataView(buf), u8 = new Uint8Array(buf);
+    const L = u8.length;
+    let p = 0;
+    const feats = [];
+    while (p + 2 <= L) {
+      const n = u8[p], k = u8[p + 1];
+      p += 2;
+      if (n < 2) break;
+      const at = p; p += 4 * n;
+      const blk = u8.subarray(p, p + 24); p += 24;
+      feats.push({ k: k, n: n, at: at, blk: blk, major: !!MAJOR_K[k] });
+    }
+    let nM = 0, nm = 0;
+    for (let i = 0; i < feats.length; i++) { if (feats[i].major) nM += feats[i].n - 1; else nm += feats[i].n - 1; }
+    const nSeg = nM + nm;
+    const geom = new ArrayBuffer(nSeg * 4 * 8);
+    const i16 = new Int16Array(geom), i8 = new Int8Array(geom), ub = new Uint8Array(geom);
+    const idx = new Uint32Array(nSeg * 6);
+    const blocks = new Uint8Array(nSeg * 24);
+    const levels = new Uint8Array(nSeg * 4);
+
+    let seg = 0;
+    function emit(f) {
+      const hwBox = Math.max(2, Math.min(255, Math.round((0.5 + (RW[f.k] || 1.15)) * 20)));
+      let px = 0, py = 0;
+      for (let i = 0; i < f.n; i++) {
+        const x = dv.getInt16(f.at + i * 4, true), y = dv.getInt16(f.at + i * 4 + 2, true);
+        if (i === 0) { px = x; py = y; continue; }
+        const dx = x - px, dy = y - py;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        const nx = Math.round(-dy / len * 127), ny = Math.round(dx / len * 127);
+        const v = seg * 4;
+        i16[v * 4] = px; i16[v * 4 + 1] = py;
+        i16[(v + 1) * 4] = px; i16[(v + 1) * 4 + 1] = py;
+        i16[(v + 2) * 4] = x; i16[(v + 2) * 4 + 1] = y;
+        i16[(v + 3) * 4] = x; i16[(v + 3) * 4 + 1] = y;
+        i8[v * 8 + 4] = -nx; i8[v * 8 + 5] = -ny;
+        i8[(v + 1) * 8 + 4] = nx; i8[(v + 1) * 8 + 5] = ny;
+        i8[(v + 2) * 8 + 4] = -nx; i8[(v + 2) * 8 + 5] = -ny;
+        i8[(v + 3) * 8 + 4] = nx; i8[(v + 3) * 8 + 5] = ny;
+        for (let j = 0; j < 4; j++) { ub[(v + j) * 8 + 6] = hwBox; ub[(v + j) * 8 + 7] = (j & 1); }
+        const o = seg * 6;
+        idx[o] = v; idx[o + 1] = v + 1; idx[o + 2] = v + 2;
+        idx[o + 3] = v + 2; idx[o + 4] = v + 1; idx[o + 5] = v + 3;
+        blocks.set(f.blk, seg * 24);
+        seg++;
+        px = x; py = y;
+      }
+    }
+    for (let i = 0; i < feats.length; i++) if (feats[i].major) emit(feats[i]);
+    for (let i = 0; i < feats.length; i++) if (!feats[i].major) emit(feats[i]);
+    console.log('road mesh', Math.round(geom.byteLength / 1048576 * 10) / 10 + 'MB',
+      'segments', nSeg, '(major', nM + ')');
+    return { geom: geom, idx: idx, blocks: blocks, levels: levels, nSeg: nSeg,
+      majorIdx: nM * 6, minorIdx: nm * 6, verts: nSeg * 4 };
+  }
+
+  // hourF에 맞춰 정점별 레벨 바이트를 갱신 (도로 paint 재계산 없이 버퍼만 갱신)
+  let lastLevelKey = '';
+  function updateRoadLevels(force) {
+    if (!roadMesh || !roadLayer || !on('roadpaint')) return;
+    const q = Math.round(hourF * 12);              // 약 5분 단위로 양자화
+    const key = q + '_' + day;
+    if (!force && key === lastLevelKey) return;
+    lastLevelKey = key;
+    const hf = ((q / 12) % 24 + 24) % 24;
+    const h0 = Math.floor(hf) % 24, fr = hf - Math.floor(hf), h1 = (h0 + 1) % 24;
+    const bo = day ? 12 : 0;
+    const o0 = bo + (h0 >> 1), o1 = bo + (h1 >> 1);
+    const hi0 = (h0 & 1) === 0, hi1 = (h1 & 1) === 0;
+    const blocks = roadMesh.blocks, out32 = roadMesh.out32;
+    const n = roadMesh.nSeg;
+    for (let s = 0; s < n; s++) {
+      const b = s * 24;
+      const b0 = blocks[b + o0], b1 = blocks[b + o1];
+      const a = hi0 ? (b0 >> 4) : (b0 & 15);
+      const c = hi1 ? (b1 >> 4) : (b1 & 15);
+      if (fr === 0 || a === c) { out32[s] = (a * 16) * 0x01010101; }
+      else { out32[s] = (((a + (c - a) * fr) * 16) | 0) * 0x01010101; }
+    }
+    roadLayer.updateLevels(roadMesh.levels);
+  }
+
+  function updateRoadStyle() {
+    const t = nightT;
+    const A = RAMP_DAY, B = RAMP_NIGHT;
+    for (let i = 0; i < 16; i++) {
+      const c = mixc(A[i], B[i], t), rgb = hx(c);
+      roadStyle.ramp[i * 3] = rgb[0] / 255;
+      roadStyle.ramp[i * 3 + 1] = rgb[1] / 255;
+      roadStyle.ramp[i * 3 + 2] = rgb[2] / 255;
+    }
+    roadStyle.glow = Math.min(1, Math.max(0, (t - 0.16) / 0.5)) * 0.34;
+    roadStyle.core = 0.96 + 0.04 * t;
+  }
+
+  const WFACT = new Float32Array([0.42, 0.46, 0.5, 0.55, 0.6, 0.66, 0.72, 0.8,
+    0.88, 0.97, 1.06, 1.16, 1.27, 1.38, 1.5, 1.64]);
+  const ZK = [[9, 0.42], [11, 0.58], [13, 0.78], [15, 1.05], [17.5, 1.45]];
+
+  function zkW(zoom) {
+    if (zoom <= ZK[0][0]) return ZK[0][1];
+    for (let i = 1; i < ZK.length; i++) {
+      if (zoom <= ZK[i][0]) {
+        const a = ZK[i - 1], b = ZK[i];
+        return a[1] + (b[1] - a[1]) * (zoom - a[0]) / (b[0] - a[0]);
+      }
+    }
+    return ZK[ZK.length - 1][1];
+  }
+
+  function makeRoadsLayer(mesh) {
+    return {
+      id: 'cityroads',
+      type: 'custom',
+      renderingMode: '3d',
+      onAdd: function (m, gl) {
+        this.map = m; this.gl = gl;
+        const vs = `
+attribute vec2 a_pos;
+attribute vec2 a_dir;
+attribute float a_hw;
+attribute float a_side;
+attribute float a_lvl;
+uniform mat4 u_m;
+uniform float u_zoomf;
+uniform float u_wmul;
+uniform float u_mpp;      // 중심 위도의 미터/px
+uniform float u_pk;       // 경사 보정 계수
+uniform vec3 u_ramp[16];
+varying float v_t;
+varying vec3 v_c;
+void main() {
+  float lv = a_lvl * (1.0 / 16.0);
+  int i0 = int(floor(lv + 0.001));
+  int i1 = i0 < 15 ? i0 + 1 : 15;
+  float fr = lv - float(i0);
+  float wf = 0.42 + 1.22 * (lv / 15.0);   // 레벨에 따른 굵기 계수(유니폼 배열 대신 산식)
+  // 색은 버텍스 셰이더에서 보간 (GLSL ES 1.00 프래그먼트는 동적 배열 인덱스 불가)
+  v_c = mix(u_ramp[i0], u_ramp[i1], fr);
+  // 화면 픽셀 폭 → 월드 두께(미터). 경사 시선 보정 u_pk 포함
+  float wpx = max(a_hw * 0.05 * u_zoomf * u_wmul * wf, 1.1);
+  float hw = wpx * 0.5 * u_mpp * u_pk;
+  vec3 cw = vec3(a_pos.x * 1.5, a_pos.y * 1.5, 0.0);
+  v_t = a_side * 2.0 - 1.0;
+  vec4 c0 = u_m * vec4(cw + vec3(a_dir.x, a_dir.y, 0.0) * hw, 1.0);
+  c0.z -= 0.0009 * c0.w;
+  gl_Position = c0;
+}`;
+        const fs = `
+precision mediump float;
+varying float v_t;
+varying vec3 v_c;
+uniform float u_alpha;
+uniform float u_glow;
+void main() {
+  float d = abs(v_t);
+  float a = u_glow > 0.5 ? exp(-d * d * 2.4) : (1.0 - smoothstep(0.55, 1.0, d));
+  a = clamp(a * u_alpha, 0.0, 1.0);
+  gl_FragColor = vec4(v_c, a);
+}`;
+        const sh = (t, s) => {
+          const o = gl.createShader(t);
+          gl.shaderSource(o, s); gl.compileShader(o);
+          if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) console.error('shader', gl.getShaderInfoLog(o));
+          return o;
+        };
+        const pr = gl.createProgram();
+        gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs));
+        gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs));
+        gl.linkProgram(pr);
+        if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) console.error('link', gl.getProgramInfoLog(pr));
+        this.prog = pr;
+        const at = (n) => gl.getAttribLocation(pr, n);
+        this.a = { pos: at('a_pos'), dir: at('a_dir'), hw: at('a_hw'), side: at('a_side'), lvl: at('a_lvl') };
+        this.u = {
+          m: gl.getUniformLocation(pr, 'u_m'), zoomf: gl.getUniformLocation(pr, 'u_zoomf'),
+          wmul: gl.getUniformLocation(pr, 'u_wmul'),
+          ramp: gl.getUniformLocation(pr, 'u_ramp'),
+          mpp: gl.getUniformLocation(pr, 'u_mpp'), pk: gl.getUniformLocation(pr, 'u_pk'),
+          alpha: gl.getUniformLocation(pr, 'u_alpha'), glow: gl.getUniformLocation(pr, 'u_glow')
+        };
+        this.vbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.geom, gl.STATIC_DRAW);
+        this.lbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.lbo);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.levels, gl.DYNAMIC_DRAW);
+        this.ibo = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.idx, gl.STATIC_DRAW);
+        this.majorIdx = mesh.majorIdx;
+        this.minorIdx = mesh.minorIdx;
+
+        const mc = maplibregl.MercatorCoordinate.fromLngLat(CENTER, 0);
+        this.k = (typeof mc.meterInMercatorCoordinateUnits === 'function')
+          ? mc.meterInMercatorCoordinateUnits()
+          : 1 / (40075016.686 * Math.cos(CENTER[1] * Math.PI / 180));
+        this.origin = [mc.x, mc.y];
+      },
+      updateLevels: function (arr) {
+        const gl = this.gl;
+        if (!gl) return;
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.lbo);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, arr);
+      },
+      render: function (gl, arg) {
+        if (!this.prog) return;
+        const matrix = arg && arg.defaultProjectionData ? arg.defaultProjectionData.mainMatrix : arg;
+        const z = this.map.getZoom();
+        const dpr = this.map.getPixelRatio ? this.map.getPixelRatio() : (window.devicePixelRatio || 1);
+        const ctr = this.map.getCenter();
+        const mpp = 40075016.686 * Math.cos(ctr.lat * Math.PI / 180) / (512 * Math.pow(2, z));
+        const pitch = this.map.getPitch();
+        // 경사 시선에서 도로 폭이 눌려 보이지 않도록 보정 (과하지 않게 최대 1.45배)
+        const pk = Math.min(1.45, 1 / Math.max(0.72, Math.sin(Math.PI / 180 * Math.max(18, pitch))));
+        const k = this.k, ox = this.origin[0], oy = this.origin[1];
+        // MapLibre 커스텀 레이어 행렬은 절대 머케이터 좌표 기준: world = origin + k*metres
+        const TS = new Float64Array([k, 0, 0, 0, 0, -k, 0, 0, 0, 0, k, 0, ox, oy, 0, 1]);
+        const M = new Float32Array(16);
+        for (let col = 0; col < 4; col++) {
+          for (let row = 0; row < 4; row++) {
+            let s = 0;
+            for (let i = 0; i < 4; i++) s += matrix[i * 4 + row] * TS[col * 4 + i];
+            M[col * 4 + row] = s;
+          }
+        }
+        const a = this.a;
+        gl.useProgram(this.prog);
+        gl.uniformMatrix4fv(this.u.m, false, M);
+        gl.uniform1f(this.u.zoomf, zkW(z));
+        gl.uniform1f(this.u.mpp, mpp);
+        gl.uniform1f(this.u.pk, pk);
+        gl.uniform3fv(this.u.ramp, roadStyle.ramp);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+        gl.enableVertexAttribArray(a.pos);
+        gl.vertexAttribPointer(a.pos, 2, gl.SHORT, false, 8, 0);
+        gl.enableVertexAttribArray(a.dir);
+        gl.vertexAttribPointer(a.dir, 2, gl.BYTE, true, 8, 4);
+        gl.enableVertexAttribArray(a.hw);
+        gl.vertexAttribPointer(a.hw, 1, gl.UNSIGNED_BYTE, false, 8, 6);
+        gl.enableVertexAttribArray(a.side);
+        gl.vertexAttribPointer(a.side, 1, gl.UNSIGNED_BYTE, false, 8, 7);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.lbo);
+        gl.enableVertexAttribArray(a.lvl);
+        gl.vertexAttribPointer(a.lvl, 1, gl.UNSIGNED_BYTE, false, 1, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
+
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.depthMask(false);
+        gl.enable(gl.BLEND);
+
+        const minorOn = z >= 12.2;
+        // 1) 도로 발광(글로우) — 가산 혼합
+        if (roadStyle.glow > 0.004 && on('glow')) {
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+          gl.uniform1f(this.u.alpha, roadStyle.glow);
+          gl.uniform1f(this.u.glow, 1);
+          gl.uniform1f(this.u.wmul, 3.4);
+          gl.drawElements(gl.TRIANGLES, this.majorIdx, gl.UNSIGNED_INT, 0);
+          if (minorOn) gl.drawElements(gl.TRIANGLES, this.minorIdx, gl.UNSIGNED_INT, this.majorIdx * 4);
+        }
+        // 2) 도로 본체
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.uniform1f(this.u.alpha, roadStyle.core);
+        gl.uniform1f(this.u.glow, 0);
+        gl.uniform1f(this.u.wmul, 1.0);
+        gl.drawElements(gl.TRIANGLES, this.majorIdx, gl.UNSIGNED_INT, 0);
+        if (minorOn) gl.drawElements(gl.TRIANGLES, this.minorIdx, gl.UNSIGNED_INT, this.majorIdx * 4);
+
+        gl.depthMask(true);
+        gl.disable(gl.BLEND);
+        gl.disableVertexAttribArray(a.pos);
+        gl.disableVertexAttribArray(a.dir);
+        gl.disableVertexAttribArray(a.hw);
+        gl.disableVertexAttribArray(a.side);
+        gl.disableVertexAttribArray(a.lvl);
+      },
+      onRemove: function (gl) {
+        if (this.vbo) gl.deleteBuffer(this.vbo);
+        if (this.ibo) gl.deleteBuffer(this.ibo);
+        if (this.lbo) gl.deleteBuffer(this.lbo);
+        if (this.prog) gl.deleteProgram(this.prog);
+      }
+    };
+  }
+
+  /* ---------------------------------------------------------------- stock road path (fallback) */
   let ROAD_SETS = [];
 
-  /* ---------------------------------------------------------------- road styling */
   function levelExpr(hour, dayIdx) {
     const hh = ((Math.round(hour) % 24) + 24) % 24;
     const key = (dayIdx ? 'q' : 'p') + (hh >> 2);
@@ -231,18 +529,7 @@
     return e;
   }
 
-  const WFACT = [0.42, 0.46, 0.5, 0.55, 0.6, 0.66, 0.72, 0.8,
-    0.88, 0.97, 1.06, 1.16, 1.27, 1.38, 1.5, 1.64];
-
   function widthExpr(hour, dayIdx, kzoom) {
-    if (!on('widthmatch')) {
-      return ['interpolate', ['linear'], ['zoom'],
-        9, ['*', ['+', 0.5, ['get', 'w']], kzoom[0]],
-        11, ['*', ['+', 0.5, ['get', 'w']], kzoom[1]],
-        13, ['*', ['+', 0.5, ['get', 'w']], kzoom[2]],
-        15, ['*', ['+', 0.5, ['get', 'w']], kzoom[3]],
-        17.5, ['*', ['+', 0.5, ['get', 'w']], kzoom[4]]];
-    }
     const lv = levelExpr(hour, dayIdx);
     const e = ['match', lv];
     for (let i = 0; i < 16; i++) e.push(i, WFACT[i]);
@@ -254,6 +541,27 @@
       13, ['*', base, e, kzoom[2]],
       15, ['*', base, e, kzoom[3]],
       17.5, ['*', base, e, kzoom[4]]];
+  }
+
+  let roadCache = {};
+  function refreshRoads(force) {
+    if (!ready || !on('roadpaint') || !on('rl')) return;
+    const hh = ((Math.round(hourF) % 24) + 24) % 24;
+    const key = hh + '_' + day + '_' + Math.round(nightT * 10);
+    if (!force && key === roadCache.key) return;
+    roadCache.key = key;
+    const T = window.__theme;
+    const ramp = T.ramp;
+    ['A', 'B'].forEach(function (sfx) {
+      if (hasLayer('road' + sfx)) {
+        safePaint('road' + sfx, 'line-color', rampMatch(hh, day, ramp));
+        safePaint('road' + sfx, 'line-width', widthExpr(hh, day, [0.42, 0.58, 0.78, 1.05, 1.45]));
+      }
+      if (hasLayer('roadglow' + sfx)) {
+        safePaint('roadglow' + sfx, 'line-color', rampMatch(hh, day, ramp));
+        safePaint('roadglow' + sfx, 'line-width', widthExpr(hh, day, [1.0, 1.4, 1.8, 2.4, 3.2]));
+      }
+    });
   }
 
   /* ---------------------------------------------------------------- custom night-lights layer */
@@ -285,7 +593,7 @@ void main() {
   gl_Position.z -= 0.0016 * gl_Position.w;   // 벽면 z-파이팅 방지
   float r = fract(a_zt.y * 0.0137 + 0.37);
   v_b = 0.42 + 0.80 * r;
-  float flick = 0.90 + 0.10 * sin(u_time * 0.7 + r * 61.0);
+  float flick = 0.93 + 0.07 * sin(u_time + r * 61.0);
   gl_PointSize = u_size * (0.6 + 0.9 * r) * flick;
 }`;
         const fs = `
@@ -295,8 +603,8 @@ uniform float u_alpha;
 void main() {
   vec2 d = gl_PointCoord - vec2(0.5);
   float r2 = dot(d, d) * 4.0;
-  float a = exp(-r2 * 3.4) * u_alpha * v_b;
-  vec3 c = mix(vec3(1.0, 0.66, 0.30), vec3(1.0, 0.95, 0.80), v_b * 0.75);
+  float a = exp(-r2 * 3.1) * u_alpha * v_b;
+  vec3 c = mix(vec3(1.0, 0.68, 0.32), vec3(1.0, 0.95, 0.82), v_b * 0.75);
   gl_FragColor = vec4(c * a, a);
 }`;
         const sh = (t, s) => {
@@ -330,11 +638,11 @@ void main() {
         const matrix = arg && arg.defaultProjectionData ? arg.defaultProjectionData.mainMatrix : arg;
         const z = this.map.getZoom();
         const dpr = this.map.getPixelRatio ? this.map.getPixelRatio() : (window.devicePixelRatio || 1);
-        const size = Math.min(13, Math.max(2.6, 2.6 + (z - 9.6) * 1.0)) * dpr;
+        const size = Math.min(11, Math.max(1.7, 1.7 + (z - 9.6) * 1.05)) * dpr;
 
-        // relative-to-eye: P * T(-origin) * S(k, -k, k)
+        // 절대 머케이터 좌표: world = origin + k*metres
         const ox = this.origin[0], oy = this.origin[1];
-        const TS = new Float64Array([k, 0, 0, 0, 0, -k, 0, 0, 0, 0, k, 0, -ox, -oy, 0, 1]);
+        const TS = new Float64Array([k, 0, 0, 0, 0, -k, 0, 0, 0, 0, k, 0, ox, oy, 0, 1]);
         const M = new Float32Array(16);
         for (let c = 0; c < 4; c++) {
           for (let r = 0; r < 4; r++) {
@@ -346,15 +654,17 @@ void main() {
         gl.useProgram(this.prog);
         gl.uniformMatrix4fv(this.u.m, false, M);
         gl.uniform1f(this.u.size, size);
-        gl.uniform1f(this.u.alpha, Math.min(1.4, 1.25 * Math.min(1, Math.max(0, (nightT - 0.10) / 0.75))));
-        gl.uniform1f(this.u.time, performance.now() / 1000);
+        const zfade = Math.min(1, Math.max(0, (z - 11.0) / 1.4));   // 도시 전경에서는 창문 불빛을 줄인다
+        gl.uniform1f(this.u.alpha, Math.min(0.9, 0.85 * Math.min(1, Math.max(0, (nightT - 0.10) / 0.75)) * zfade));
+        // 벽면 불빛 깜빡임은 '지도 시간'에만 연동한다 (일시정지 시 완전히 정지)
+        gl.uniform1f(this.u.time, hourF * 520.0);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
         gl.enableVertexAttribArray(this.axy);
         gl.vertexAttribPointer(this.axy, 2, gl.SHORT, false, 6, 0);
         gl.enableVertexAttribArray(this.azt);
         gl.vertexAttribPointer(this.azt, 2, gl.UNSIGNED_BYTE, false, 6, 4);
         gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);   // 가산 대신 일반 알파: 밀집 지역이 하얗게 타지 않게
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LEQUAL);
         gl.depthMask(false);
@@ -441,27 +751,45 @@ void main() {
     map.addLayer({ id: 'water', type: 'fill', source: 'water',
       paint: { 'fill-color': DAY.water, 'fill-opacity': 0.96 } });
 
-    // 도로
-    const ROADS = on('roads'), BLD_ON = on('bld');
-    ROAD_SETS.forEach(function (rs) {
-      if (!ROADS) return;
-      map.addSource('road' + rs.id, { type: 'geojson', data: rs.data, maxzoom: 15 });
-      if (on('glow') && rs.id === 'A') {
-        map.addLayer({ id: 'roadglow' + rs.id, type: 'line', source: 'road' + rs.id,
+    // 도로: 커스텀 레이어(셰이더) — 시간에 따라 paint 재계산 없이 유니폼/버퍼만 갱신
+    const BLD_ON = on('bld');
+    if (roadMesh && on('roads')) {
+      try {
+        roadLayer = makeRoadsLayer(roadMesh);
+        map.addLayer(roadLayer);
+      } catch (e) {
+        console.warn('커스텀 도로 레이어 실패, 기본 도로로 대체', e);
+        roadLayer = null;
+      }
+    }
+    if (!roadLayer || !on('rl')) {
+      // 폴백: 기존 GeoJSON 라인 레이어
+      const ROADS = on('roads');
+      if (ROADS) {
+        if (!roads) roads = decodeRoads(roadsBuf);
+        ROAD_SETS = [{ id: 'A', data: roads.major, minzoom: 0 },
+                     { id: 'B', data: roads.minor, minzoom: 12.2 }];
+      }
+      ROAD_SETS.forEach(function (rs) {
+        if (!ROADS) return;
+        map.addSource('road' + rs.id, { type: 'geojson', data: rs.data, maxzoom: 15 });
+        if (on('glow') && rs.id === 'A') {
+          map.addLayer({ id: 'roadglow' + rs.id, type: 'line', source: 'road' + rs.id,
+            minzoom: rs.minzoom,
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: { 'line-color': rampMatch(15, 0, RAMP_DAY),
+              'line-width': widthExpr(15, 0, [1.0, 1.4, 1.8, 2.4, 3.2]),
+              'line-blur': ['interpolate', ['linear'], ['zoom'], 9, 3, 12, 5, 16, 9],
+              'line-opacity': DAY.glowOp } });
+        }
+        map.addLayer({ id: 'road' + rs.id, type: 'line', source: 'road' + rs.id,
           minzoom: rs.minzoom,
           layout: { 'line-cap': 'round', 'line-join': 'round' },
           paint: { 'line-color': rampMatch(15, 0, RAMP_DAY),
-            'line-width': widthExpr(15, 0, [1.0, 1.4, 1.8, 2.4, 3.2]),
-            'line-blur': ['interpolate', ['linear'], ['zoom'], 9, 3, 12, 5, 16, 9],
-            'line-opacity': DAY.glowOp } });
-      }
-      map.addLayer({ id: 'road' + rs.id, type: 'line', source: 'road' + rs.id,
-        minzoom: rs.minzoom,
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': rampMatch(15, 0, RAMP_DAY),
-          'line-width': widthExpr(15, 0, [0.42, 0.58, 0.78, 1.05, 1.45]),
-          'line-opacity': DAY.coreOp } });
-    });
+            'line-width': widthExpr(15, 0, [0.42, 0.58, 0.78, 1.05, 1.45]),
+            'line-opacity': DAY.coreOp } });
+      });
+    }
 
     const bcol = ['match', ['get', 'c']];
     for (let i = 0; i < 16; i++) bcol.push(i, BLD[i]);
@@ -493,7 +821,8 @@ void main() {
   }
 
   /* ---------------------------------------------------------------- theme application */
-  function applyTheme(t, force) {
+  // 테마(스타일) 갱신은 양자화해서 — 재생 중 매 프레임 스타일 재계산으로 끊기지 않도록
+  function applyTheme(t) {
     const T = themeAt(t);
     window.__theme = T;
     document.body.classList.toggle('is-night', t > 0.52);
@@ -534,40 +863,19 @@ void main() {
     if (hasLayer('b_water')) safePaint('b_water', 'fill-color', T.water);
     if (hasLayer('water')) safePaint('water', 'fill-color', T.water);
 
-    ['A', 'B'].forEach(function (sfx) {
-      if (hasLayer('roadglow' + sfx)) {
-        safePaint('roadglow' + sfx, 'line-opacity', T.glowOp);
-        map.setLayoutProperty('roadglow' + sfx, 'visibility', t > 0.32 ? 'visible' : 'none');
-      }
-    });
+    if (!roadLayer) {
+      ['A', 'B'].forEach(function (sfx) {
+        if (hasLayer('roadglow' + sfx)) {
+          safePaint('roadglow' + sfx, 'line-opacity', T.glowOp);
+          map.setLayoutProperty('roadglow' + sfx, 'visibility', t > 0.32 ? 'visible' : 'none');
+        }
+      });
+      refreshRoads(true);
+    }
     if (on('light')) try {
       map.setLight({ anchor: 'viewport', color: T.light.color,
         intensity: T.light.intensity, position: T.light.pos });
     } catch (e) {}
-
-    refreshRoads(true);
-  }
-
-  /* ---------------------------------------------------------------- roads by hour */
-  let roadCache = {};
-  function refreshRoads(force) {
-    if (!ready || !on('roadpaint')) return;
-    const hh = ((Math.round(hourF) % 24) + 24) % 24;
-    const key = hh + '_' + day + '_' + Math.round(nightT * 10);
-    if (!force && key === roadCache.key) return;
-    roadCache.key = key;
-    const T = window.__theme;
-    const ramp = T.ramp;
-    ['A', 'B'].forEach(function (sfx) {
-      if (hasLayer('road' + sfx)) {
-        safePaint('road' + sfx, 'line-color', rampMatch(hh, day, ramp));
-        safePaint('road' + sfx, 'line-width', widthExpr(hh, day, [0.42, 0.58, 0.78, 1.05, 1.45]));
-      }
-      if (hasLayer('roadglow' + sfx)) {
-        safePaint('roadglow' + sfx, 'line-color', rampMatch(hh, day, ramp));
-        safePaint('roadglow' + sfx, 'line-width', widthExpr(hh, day, [1.0, 1.4, 1.8, 2.4, 3.2]));
-      }
-    });
   }
 
   /* ---------------------------------------------------------------- UI */
@@ -580,32 +888,37 @@ void main() {
     $('daylab').textContent = (day ? '주말 평균' : '평일 평균');
   }
 
-  function setMood() {
-    let t;
-    if (mode === 'day') t = 0;
-    else if (mode === 'night') t = 1;
-    else t = nightFactor(hourF);
-    if (Math.abs(t - nightT) < 0.008 && ready) return;
-    nightT = t;
-    applyTheme(t, false);
-    // 창문 불빛이 켜져 있는 동안 계속 그리기
-    if (t > 0.05) startGlowLoop();
+  function moodFactor() {
+    if (mode === 'day') return 0;
+    if (mode === 'night') return 1;
+    return nightFactor(hourF);
   }
 
-  let glowRAF = 0;
-  function startGlowLoop() {
-    if (glowRAF) return;
-    const loop = () => {
-      if (nightT > 0.05) { map.triggerRepaint(); glowRAF = requestAnimationFrame(loop); }
-      else { glowRAF = 0; }
-    };
-    glowRAF = requestAnimationFrame(loop);
+  function setMood(force) {
+    const t = moodFactor();
+    if (!force && Math.abs(t - nightT) < 1e-4) return;
+    nightT = t;
+    updateRoadStyle();                    // 도로 램프·발광: 유니폼만 (매끄럽게)
+    const q = Math.round(t * 24) / 24;    // 스타일 갱신은 1/24 단계로만
+    if (force || Math.abs(q - appliedT) > 1e-6) {
+      appliedT = q;
+      applyTheme(q);
+    }
+  }
+
+  // 한 프레임의 시간 진행 처리: 값 갱신은 모두 저렴한 경로(유니폼·버퍼·DOM)만 사용
+  function frameStep() {
+    updateClock();
+    setMood(false);
+    updateRoadLevels(false);
+    if (map && playing) map.triggerRepaint();
   }
 
   function applyHour(force) {
     updateClock();
-    setMood();
-    refreshRoads(!!force);
+    setMood(true);
+    updateRoadLevels(true);
+    if (map) map.triggerRepaint();
   }
 
   function bindUI() {
@@ -619,9 +932,9 @@ void main() {
         document.querySelectorAll('#dayseg button').forEach(x => x.classList.remove('on'));
         b.classList.add('on');
         day = parseInt(b.dataset.day, 10);
-        roadCache = {};
-        refreshRoads(true);
+        updateRoadLevels(true);
         updateClock();
+        if (map) map.triggerRepaint();
       });
     });
     document.querySelectorAll('#mseg button').forEach(b => {
@@ -629,27 +942,30 @@ void main() {
         document.querySelectorAll('#mseg button').forEach(x => x.classList.remove('on'));
         b.classList.add('on');
         mode = b.dataset.mode;
-        setMood();
+        setMood(true);
+        if (map) map.triggerRepaint();
       });
     });
     const btn = $('play');
     let raf = 0, prev = 0;
+    const SPEED = 1.6;                    // 한 바퀴 약 15초
     function tick(ts) {
-      if (!playing) return;
+      if (!playing) { raf = 0; return; }
       if (!prev) prev = ts;
-      const dt = Math.min(0.1, (ts - prev) / 1000); prev = ts;
-      hourF = (hourF + dt * 1.6) % 24;      // 한 바퀴 약 15초
+      let dt = (ts - prev) / 1000;
+      prev = ts;
+      if (!(dt > 0) || dt > 0.25) dt = 1 / 60;   // 탭 전환 등으로 시간이 튀지 않게
+      hourF = (hourF + dt * SPEED) % 24;
       sl.value = hourF.toFixed(2);
-      updateClock();
-      setMood();
-      if (Math.floor(hourF) !== Math.floor(hourF - dt * 1.6 + 24) % 24) refreshRoads(false);
+      frameStep();
       raf = requestAnimationFrame(tick);
     }
     btn.addEventListener('click', () => {
       playing = !playing;
       btn.textContent = playing ? '❚❚' : '▶';
-      if (playing) { prev = 0; raf = requestAnimationFrame(tick); }
-      else if (raf) cancelAnimationFrame(raf);
+      if (playing) { prev = 0; if (!raf) raf = requestAnimationFrame(tick); }
+      else if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (map) map.triggerRepaint();
     });
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Space') { e.preventDefault(); btn.click(); }
@@ -692,15 +1008,18 @@ void main() {
           buildings = decodeBuildings(buildingsBuf);
           stat('건물 ' + (buildings.major.features.length + buildings.minor.features.length).toLocaleString() + '동 배치 중…', 64);
           setTimeout(() => {
-            roads = decodeRoads(roadsBuf);
-            ROAD_SETS = [{ id: 'A', data: roads.major, minzoom: 0 },
-                         { id: 'B', data: roads.minor, minzoom: 12.2 }];
+            roadMesh = buildRoadMesh(roadsBuf);
+            window.__roadMesh = roadMesh;
+            roadMesh.out32 = new Uint32Array(roadMesh.levels.buffer);
             water = waterRings;
-            stat('도로 ' + (roads.major.features.length + roads.minor.features.length).toLocaleString() + '개 · 한강 배치 중…', 80);
+            stat('도로 ' + roadMesh.nSeg.toLocaleString() + '구간 · 한강 배치 중…', 80);
             setTimeout(() => {
               addDataLayers();
               ready = true;
-              applyTheme(nightT = nightFactor(hourF), true);
+              nightT = moodFactor();
+              updateRoadStyle();
+              applyTheme(appliedT = Math.round(nightT * 24) / 24);
+              updateRoadLevels(true);
               updateClock();
               bindUI();
               window.__view = {
@@ -710,23 +1029,26 @@ void main() {
                   document.querySelectorAll('#mseg button').forEach(function (x) {
                     x.classList.toggle('on', x.dataset.mode === m);
                   });
-                  setMood();
+                  setMood(true);
+                  if (map) map.triggerRepaint();
                 },
                 setDay: function (d) {
                   day = d;
                   document.querySelectorAll('#dayseg button').forEach(function (x) {
                     x.classList.toggle('on', +x.dataset.day === d);
                   });
-                  roadCache = {}; refreshRoads(true); updateClock();
+                  updateRoadLevels(true); updateClock();
+                  if (map) map.triggerRepaint();
                 },
+                play: function (v) { if (!!v !== playing) $('play').click(); },
                 fly: function (o) { map.easeTo(Object.assign({ duration: 0 }, o)); },
-                state: function () { return { hour: hourF, day: day, mode: mode, t: nightT, zoom: map.getZoom() }; }
+                state: function () { return { hour: hourF, day: day, mode: mode, t: nightT, zoom: map.getZoom(), cooled: lastLevelKey }; }
               };
               stat('완료', 100);
               setTimeout(() => { $('loading').classList.add('gone'); }, 300);
               console.log('ready', ((performance.now() - t0) / 1000).toFixed(1) + 's',
                 buildings.major.features.length + buildings.minor.features.length,
-                roads.major.features.length + roads.minor.features.length);
+                roadMesh.nSeg);
               window.__ready = true;
             }, 40);
           }, 40);
